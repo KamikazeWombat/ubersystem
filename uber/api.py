@@ -12,6 +12,7 @@ from pockets import unwrap
 from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import subqueryload
 from sqlalchemy.orm.exc import NoResultFound, MultipleResultsFound
+
 from uber.barcode import get_badge_num_from_barcode
 from uber.config import c
 from uber.decorators import department_id_adapter
