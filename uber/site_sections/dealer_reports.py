@@ -45,7 +45,7 @@ class Root:
                     group.zip_code,
                     group.country,
                     group.tables,
-                    group.amount_paid,
+                    group.amount_paid / 100,
                     group.cost,
                     group.badges
                 ])
@@ -69,4 +69,53 @@ class Root:
             'Primary Contact',
             'Contact Phone #',
             'Physical Address']
+        out.writerows(header_row, rows)
+        
+    @xlsx_file
+    def waitlisted_group_info(self, out, session):
+        waitlisted_groups = session.query(Group).filter(Group.status == c.WAITLISTED).all()
+        rows = []
+        for group in waitlisted_groups:
+            if group.is_dealer:
+                rows.append([
+                    group.name,
+                    group.leader.full_name,
+                    group.leader.email,
+                    group.website,
+                    group.physical_address
+                ])
+        header_row = [
+            'Group Name',
+            'Group Leader Name',
+            'Group Leader Email',
+            'Website',
+            ]
+        out.writerows(header_row, rows)
+        
+    @xlsx_file
+    def seller_tax_info(self, out, session):
+        waitlisted_groups = session.query(Group).filter(Group.status == c.APPROVED).all()
+        rows = []
+        for group in waitlisted_groups:
+            if group.is_dealer:
+                rows.append([
+                    group.name,
+                    group.leader.full_name,
+                    group.leader.email,
+                    group.physical_address,
+                    group.leader.cellphone,
+                    group.special_needs,
+                    group.admin_notes,
+                    group.wares,
+                ])
+        header_row = [
+            'Business Name',
+            'Group Leader Name',
+            'Group Leader Email',
+            'Business Address',
+            'Business Phone Number',
+            'Special Requests',
+            'Admin Notes',
+            'What They Sell',
+            ]
         out.writerows(header_row, rows)

@@ -3,8 +3,8 @@
 {% import "fields/group.html" as group_fields with context %}
 {% block title %}Group Members{% endblock %}
 {% block backlink %}
-    {% if c.HAS_DEALER_ADMIN_ACCESS %}
-        <a href="../dealer_admin/form?id={{ group.id }}" style="float:right">Return to Group Admin Form</a>
+    {% if c.HAS_GROUP_ADMIN_ACCESS %}
+        <a href="../group_admin/form?id={{ group.id }}" style="float:right">Return to Group Admin Form</a>
     {% endif %}
 {% endblock %}
 {% block content %}
@@ -66,7 +66,7 @@
       <h2>"{{ group.name }}" Information</h2>
       <form method="post" action="group_members" class="form-horizontal" role="form">
         <input type="hidden" name="id" value="{{ group.id }}" />
-        {% if not page_ro %}{{ group_fields.name }}{% endif %}
+        {% if not page_ro %}{{ group_fields.group_name }}{% endif %}
         {{ group_fields.categories }}
         {{ group_fields.wares }}
         {{ group_fields.description }}
@@ -98,6 +98,9 @@
         invalid. You may also distribute each of the registration links below to the individual members of your group,
         which will allow them to fill in their own information as well as purchase any upgrades on their own.
         <br/> <br/>
+    {% endif %}
+    {% if group.guest %}
+      Please check your badge information to ensure it is correct.<br/><br/>
     {% endif %}
     If a {{ group.is_dealer|yesno("planned " + c.DEALER_HELPER_TERM + ",group member") }} cannot attend, you may use the "This person
     isn't coming" button next to their entry on the list below to unset their badge, which may then be assigned to
@@ -138,7 +141,7 @@
                 {% elif attendee.is_transferable and attendee.total_donation %}
                   <form method="get" action="transfer_badge">
                     <input type="hidden" name="id" value="{{ attendee.id }}" />
-                    <b> Added on an extra ${{ attendee.total_donation }}! </b>
+                    <b> Added on an extra ${{ '%0.2f' % attendee.total_donation }}! </b>
                     <input type="submit" value="Transfer Registration" />
                   </form>
                 {% endif %}

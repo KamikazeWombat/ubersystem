@@ -1,10 +1,9 @@
-import inspect
 import uuid
 from collections import defaultdict
 
 import bcrypt
 import cherrypy
-from pockets import unwrap
+from sqlalchemy import or_
 from sqlalchemy.orm import subqueryload
 from sqlalchemy.orm.exc import NoResultFound
 
@@ -27,10 +26,6 @@ def valid_password(password, account):
     return any(bcrypt.hashpw(password, hashed) == hashed for hashed in all_hashed)
 
 
-def access_group_opts(session):
-    return [(id, name) for id, name in session.query(AccessGroup.id, AccessGroup.name).order_by(AccessGroup.name)]
-
-
 @all_renderable()
 class Root:
     def index(self, session, message=''):
@@ -48,7 +43,6 @@ class Root:
                          .options(subqueryload(AdminAccount.attendee).subqueryload(Attendee.assigned_depts))
                          .order_by(Attendee.last_first).all()),
             'all_attendees': sorted(attendees, key=lambda tup: tup[1]),
-            'access_group_opts': access_group_opts(session),
         }
 
     @csrf_protected
@@ -69,6 +63,7 @@ class Root:
             account.attendee = attendee
             session.add(account)
             if account.is_new and not c.AT_OR_POST_CON:
+                session.commit()
                 body = render('emails/accounts/new_account.txt', {
                     'account': account,
                     'password': password,
@@ -103,7 +98,6 @@ class Root:
         return {
             'department_id':  department_id,
             'attendees': attendees,
-            'access_group_opts': access_group_opts(session),
         }
 
     def access_groups(self, session, message='', **params):
@@ -134,7 +128,6 @@ class Root:
         return {
             'message': message,
             'access_group': access_group,
-            'access_group_opts': access_group_opts(session)
         }
 
     @ajax
@@ -181,10 +174,25 @@ class Root:
         }
 
     @public
-    def homepage(self, message=''):
+    def homepage(self, session, message=''):
         if not cherrypy.session.get('account_id'):
             raise HTTPRedirect('login?message={}', 'You are not logged in')
-        return {'message': message}
+        
+        return {
+            'message': message,
+            'site_sections': [key for key in session.access_query_matrix().keys() if getattr(c, 'HAS_' + key.upper() + '_ACCESS')]
+            }
+        
+    @public
+    def attendees(self, session, query=''):
+        if not cherrypy.session.get('account_id'):
+            raise HTTPRedirect('login?message={}', 'You are not logged in')
+        
+        attendees = session.access_query_matrix()[query].limit(c.ROW_LOAD_LIMIT).all() if query else None
+        
+        return {
+            'attendees': attendees,
+            }
 
     @public
     def logout(self):
@@ -235,7 +243,7 @@ class Root:
 
         if updater_password is not None:
             new_password = new_password.strip()
-            updater_account = session.admin_account(cherrypy.session['account_id'])
+            updater_account = session.admin_account(cherrypy.session.get('account_id'))
             if not new_password:
                 message = 'New password is required'
             elif not valid_password(updater_password, updater_account):
@@ -268,7 +276,7 @@ class Root:
 
         if old_password is not None:
             new_password = new_password.strip()
-            account = session.admin_account(cherrypy.session['account_id'])
+            account = session.admin_account(cherrypy.session.get('account_id'))
             if not new_password:
                 message = 'New password is required'
             elif not valid_password(old_password, account):
@@ -307,26 +315,7 @@ class Root:
 
     @public
     def sitemap(self):
-        site_sections = cherrypy.tree.apps[c.CHERRYPY_MOUNT_PATH].root
-        modules = {name: getattr(site_sections, name) for name in dir(site_sections) if not name.startswith('_')}
-        pages = defaultdict(list)
-        for module_name, module_root in modules.items():
-            for name in dir(module_root):
-                method = getattr(module_root, name)
-                if getattr(method, 'exposed', False):
-                    spec = inspect.getfullargspec(unwrap(method))
-                    has_defaults = len([arg for arg in spec.args[1:] if arg != 'session']) == len(spec.defaults or [])
-                    if c.has_section_or_page_access(page_path='/{}/{}'.format(module_name, name), include_read_only=True) \
-                            and not getattr(method, 'ajax', False) \
-                            and (getattr(method, 'site_mappable', False)
-                                 or has_defaults and not spec.varkw):
-
-                        pages[module_name].append({
-                            'name': name.replace('_', ' ').title(),
-                            'path': '/{}/{}'.format(module_name, name)
-                        })
-
-        return {'pages': sorted(pages.items())}
+        return {'pages': c.SITE_MAP}
 
     @ajax
     def add_bulk_admin_accounts(self, session, message='', **params):

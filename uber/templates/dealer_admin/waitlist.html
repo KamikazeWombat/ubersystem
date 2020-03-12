@@ -15,8 +15,8 @@
         backdrop: true,
         title: 'Decline All Waitlisted {{ c.DEALER_TERM|title }}s?',
         message: '<p>Are you sure you want to decline <b>EVERY</b> waitlisted {{ c.DEALER_TERM }}?</p>' +
-          '<p>This will delete the groups and convert the badges to normal Attendee badges ' +
-          'at the price of registration when they first applied. An email will be sent to ' +
+          '<p>This will convert the badges to normal Attendee badges at the price of registration ' +
+          'when they first applied, minus the group discount. An email will be sent to ' +
           'each declined {{ c.DEALER_TERM }}.</p>' +
           '<p>This <b>CANNOT</b> be undone.</p>',
         buttons: {
@@ -34,8 +34,12 @@
 </script>
 
 <h2>
-  <form id="form-decline" method="POST" action="waitlist" class="pull-right">
+  <form id="form-decline" method="POST" action="waitlist" class="pull-right form-inline">
     <input type="hidden" name="decline_and_convert" value="1">
+    <a href="../dealer_reports/waitlisted_group_info" class="btn btn-info">
+      <span class="glyphicon glyphicon-download-alt"></span>
+      Waitlisted {{ c.DEALER_TERM|title }} Report
+    </a>
     <button type="submit" class="btn btn-danger">
       <span class="glyphicon glyphicon-repeat"></span>
       Decline & Convert
@@ -60,7 +64,7 @@
   <tbody>
 {% for group in groups %}
     <tr>
-        <td style="text-align:left" data-order="{{ group.name }}" data-search="{{ group.name }}"> <a href="form?id={{ group.id }}">{{ group.name|default('?????', boolean=True) }}</a> </td>
+        <td style="text-align:left" data-order="{{ group.name }}" data-search="{{ group.name }}"> <a href="../group_admin/form?id={{ group.id }}">{{ group.name|default('?????', boolean=True) }}</a> </td>
         <td>
             {% if group.is_dealer %}
                 {{ group.status_label }}
@@ -70,9 +74,9 @@
         </td>
         <td data-order="{{ group.badges_purchased }}" data-search="{{ group.badges_purchased }}"> {{ group.badges_purchased }} / {{ group.badges }} </td>
         <td>{{ group.tables }}</td>
-        <td>${{ group.cost }}</td>
-        <td>${{ group.amount_unpaid }}</td>
-        <td>${{ group.amount_paid }}</td>
+        <td>${{ '%0.2f' % group.cost }}</td>
+        <td>${{ '%0.2f' % group.amount_unpaid }}</td>
+        <td>${{ '%0.2f' % (group.amount_paid / 100) }}</td>
         <td>{{ group.admin_notes }}</td>
     </tr>
 {% endfor %}

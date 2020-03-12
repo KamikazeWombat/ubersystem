@@ -1,3 +1,4 @@
+import cgi
 import csv
 import functools
 import inspect
@@ -50,7 +51,7 @@ def log_pageview(func):
     def with_check(*args, **kwargs):
         with uber.models.Session() as session:
             try:
-                session.admin_account(cherrypy.session['account_id'])
+                session.admin_account(cherrypy.session.get('account_id'))
             except Exception:
                 pass  # we don't care about public pages for this version
             else:
@@ -85,18 +86,7 @@ def check_if_can_reg(func):
                 return render('static_views/dealer_reg_closed.html')
             else:
                 return render('static_views/dealer_reg_not_open.html')
-        elif c.ATTENDEE_BADGES_SOLD >= c.MAX_BADGE_SALES:
-            # ===============================================================
-            # TODO: MAKE THIS COMPARE THE SPECIFIC BADGE TYPE AGAINST OUR
-            # STOCKS OF THAT TYPE. LUMPING ALL THE BADGE TYPES TOGETHER
-            # AND COMPARING AGAINST A SINGLE NUMBER DOESN'T MAKE SENSE,
-            # BECAUSE WE HAVE DIFFERENT NUMBERS OF PHYSICAL BADGES FOR EACH
-            # BADGE TYPE.
-            #
-            # FOR NOW, THIS IS COOL, BECAUSE THE ONLY BADGE TYPE WE ARE
-            # WORRIED ABOUT SELLING OUT IS ATTENDEE_BADGE. BUT THAT MAY NOT
-            # ALWAYS BE THE CASE.
-            # ===============================================================
+        elif not c.ATTENDEE_BADGE_AVAILABLE:
             return render('static_views/prereg_soldout.html')
         elif c.BEFORE_PREREG_OPEN and not is_dealer_reg:
             return render('static_views/prereg_not_yet_open.html')
@@ -152,11 +142,11 @@ department_id_adapter = argmod(['location', 'department', 'department_id'], lamb
 
 
 @department_id_adapter
-def check_dept_admin(session, department_id=None, inherent_role=None):
+def check_can_edit_dept(session, department_id=None, inherent_role=None, override_access=None):
     from uber.models import AdminAccount, DeptMembership, Department
-    account_id = cherrypy.session['account_id']
+    account_id = cherrypy.session.get('account_id')
     admin_account = session.query(AdminAccount).get(account_id)
-    if not admin_account.access_group.full_dept_admin:
+    if not getattr(admin_account, override_access, None):
         dh_filter = [
             AdminAccount.id == account_id,
             AdminAccount.attendee_id == DeptMembership.attendee_id]
@@ -179,14 +169,12 @@ def check_dept_admin(session, department_id=None, inherent_role=None):
             return 'You must be a department admin{} to complete that action.'.format(dept_msg)
 
 
-def assert_dept_admin(session, department_id=None, inherent_role=None):
-    message = check_dept_admin(session, department_id, inherent_role)
-    if message:
-        raise HTTPRedirect("../landing/invalid?message={}", message)
+def check_dept_admin(session, department_id=None, inherent_role=None):
+    return check_can_edit_dept(session, department_id, inherent_role, override_access='full_dept_admin')
 
 
-def requires_dept_admin(func=None, inherent_role=None):
-    def _decorator(func, inherent_role=None):
+def requires_admin(func=None, inherent_role=None, override_access=None):
+    def _decorator(func, inherent_role=inherent_role):
         @wraps(func)
         def _protected(*args, **kwargs):
             if cherrypy.request.method == 'POST':
@@ -194,7 +182,9 @@ def requires_dept_admin(func=None, inherent_role=None):
                     'department_id', kwargs.get('department', kwargs.get('location', kwargs.get('id'))))
 
                 with uber.models.Session() as session:
-                    assert_dept_admin(session, department_id, inherent_role)
+                    message = check_can_edit_dept(session, department_id, inherent_role, override_access)
+                    if message:
+                        raise HTTPRedirect('../landing/invalid?message={}'.format(message))
             return func(*args, **kwargs)
         return _protected
 
@@ -202,6 +192,14 @@ def requires_dept_admin(func=None, inherent_role=None):
         return functools.partial(_decorator, inherent_role=func)
     else:
         return _decorator(func)
+
+
+def requires_dept_admin(func=None, inherent_role=None):
+    return requires_admin(func, inherent_role, override_access='full_dept_admin')
+
+
+def requires_shifts_admin(func=None, inherent_role=None):
+    return requires_admin(func, inherent_role, override_access='full_shifts_admin')
 
 
 def csrf_protected(func):
@@ -239,7 +237,9 @@ def ajax_gettable(func):
 
 
 def multifile_zipfile(func):
-    func.site_mappable = True
+    parameters = inspect.getargspec(func)
+    if len(parameters[0]) == 3:
+        func.site_mappable = True
 
     @wraps(func)
     def zipfile_out(self, session, **kwargs):
@@ -604,6 +604,32 @@ def public(func):
     func.public = True
     return func
 
+def attendee_view(func):
+    func.public = True
+    @wraps(func)
+    def with_check(*args, **kwargs):
+        if cherrypy.session.get('account_id') is None:
+                raise HTTPRedirect('../accounts/login?message=You+are+not+logged+in', save_location=True)
+            
+        if kwargs.get('id') != "None":
+            with uber.models.Session() as session:
+                attendee = session.attendee(kwargs.get('id'), allow_invalid=True)
+                if not session.admin_can_see_staffer(attendee) and attendee not in session.viewable_attendees():
+                    return "<div id='attendeeData' style='padding: 10px;'>" \
+                           "You are not allowed to view this attendee. If you think this is an error, " \
+                           "please email us at {}.</div>".format(cgi.escape(c.DEVELOPER_EMAIL))
+        return func(*args, **kwargs)
+    return with_check
+
+def schedule_view(func):
+    func.public = True
+    @wraps(func)
+    def with_check(*args, **kwargs):
+        if c.HIDE_SCHEDULE and not c.HAS_READ_ACCESS:
+            return "The {} schedule is being developed and will be made public " \
+                   "when it's closer to being finalized.".format(c.EVENT_NAME)
+        return func(*args, **kwargs)
+    return with_check
 
 def restricted(func):
     @wraps(func)
@@ -643,6 +669,8 @@ class all_renderable:
         self.public = public
 
     def __call__(self, klass):
+        if self.public:
+            klass = public(klass)
         for name, func in klass.__dict__.items():
             if hasattr(func, '__call__'):
                 new_func = set_renderable(func, self.public)

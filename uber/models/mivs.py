@@ -87,6 +87,8 @@ class IndieStudio(MagModel):
     needs_hotel_space = Column(Boolean, nullable=True, admin_only=True)  # "Admin only" preserves null default
     name_for_hotel = Column(UnicodeText)
     email_for_hotel = Column(UnicodeText)
+    contact_phone = Column(UnicodeText)
+    show_info_updated = Column(Boolean, default=False)
 
     games = relationship(
         'IndieGame', backref='studio', order_by='IndieGame.title')
@@ -115,7 +117,7 @@ class IndieStudio(MagModel):
         sorted_games = sorted(
             [g for g in self.games if g.accepted], key=lambda g: g.accepted)
         confirm_deadline = timedelta(days=c.MIVS_CONFIRM_DEADLINE)
-        return sorted_games[0].accepted + confirm_deadline
+        return sorted_games[0].accepted + confirm_deadline if len(sorted_games) else None
 
     @property
     def after_confirm_deadline(self):
@@ -124,6 +126,13 @@ class IndieStudio(MagModel):
     @property
     def discussion_emails_list(self):
         return list(filter(None, self.discussion_emails.split(',')))
+    
+    @property
+    def discussion_emails_last_updated(self):
+        studio_updates = self.get_tracking_by_instance(self, action=c.UPDATED, last_only=False)
+        for update in studio_updates:
+            if 'discussion_emails' in update.data:
+                return update.when
 
     @property
     def core_hours_status(self):
@@ -153,11 +162,15 @@ class IndieStudio(MagModel):
         if self.needs_hotel_space is not None:
             return "Requested hotel space for {} with email {}".format(self.name_for_hotel, self.email_for_hotel)\
                 if self.needs_hotel_space else "Opted out"
+                
+    @property
+    def show_info_status(self):
+        return self.show_info_updated
 
     def checklist_deadline(self, slug):
         default_deadline = c.MIVS_CHECKLIST[slug]['deadline']
-        if self.group and self.group.registered >= default_deadline and slug != 'hotel_space':
-            return self.group.registered + timedelta(days=3)
+        if self.group and self.group.registered >= default_deadline and slug in ['core_hours', 'discussion']:
+            return self.group.registered + timedelta(days=7)
         return default_deadline
 
     def past_checklist_deadline(self, slug):
@@ -202,6 +215,10 @@ class IndieStudio(MagModel):
     @property
     def submitted_games(self):
         return [g for g in self.games if g.submitted]
+    
+    @property
+    def confirmed_games(self):
+        return [g for g in self.games if g.confirmed]
 
     @property
     def comped_badges(self):
@@ -501,7 +518,7 @@ class IndieGameImage(MagModel):
 
     @property
     def url(self):
-        return '{}/mivs/view_image?id={}'.format(c.PATH, self.id)
+        return 'view_image?id={}'.format(self.id)
 
     @property
     def filepath(self):

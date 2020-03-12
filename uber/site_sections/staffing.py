@@ -22,7 +22,6 @@ class Root:
     def printable(self, session):
         return {'attendee': session.logged_in_volunteer()}
 
-    @check_shutdown
     def food_restrictions(self, session, message='', **params):
         from uber.models.attendee import FoodRestrictions
         attendee = session.logged_in_volunteer()
@@ -50,7 +49,7 @@ class Root:
                 message = 'You must select a shirt size'
             else:
                 attendee.shirt = int(shirt)
-                if c.STAFF_EVENT_SHIRT_OPTS and c.BEFORE_SHIRT_DEADLINE:
+                if c.STAFF_EVENT_SHIRT_OPTS and c.BEFORE_SHIRT_DEADLINE and num_event_shirts:
                     attendee.num_event_shirts = int(num_event_shirts)
                 raise HTTPRedirect('index?message={}', 'Shirt info uploaded')
 
@@ -76,7 +75,39 @@ class Root:
             'attendee': attendee,
             'agreement_end_date': c.ESCHATON.date() + timedelta(days=31),
         }
+        
+    @check_shutdown
+    def emergency_procedures(self, session, message='', reviewed_procedures=None, csrf_token=None):
+        attendee = session.logged_in_volunteer()
+        if csrf_token is not None:
+            check_csrf(csrf_token)
+            if reviewed_procedures:
+                attendee.reviewed_emergency_procedures = True
+                raise HTTPRedirect('index?message={}', 'Thanks for reviewing our emergency procedures!')
 
+            message = "You must acknowledge that you reviewed our emerency procedures"
+
+        return {
+            'message': message,
+            'attendee': attendee,
+            'agreement_end_date': c.ESCHATON.date() + timedelta(days=31),
+        }
+        
+    @check_shutdown
+    def credits(self, session, message='', name_in_credits='', csrf_token=None):
+        attendee = session.logged_in_volunteer()
+        if csrf_token is not None:
+            check_csrf(csrf_token)
+            attendee.name_in_credits = name_in_credits
+            message = "Thank you for providing a name for the credits roll!" if name_in_credits \
+                else "You have opted out of having your name in the credits roll."
+            raise HTTPRedirect('index?message={}', message)
+            
+        return {
+            'message': message,
+            'attendee': attendee,
+        }
+            
     @check_shutdown
     @public
     def volunteer(self, session, id, csrf_token=None, requested_depts_ids=None, message=''):
@@ -207,6 +238,11 @@ class Root:
     @check_shutdown
     @ajax
     def drop(self, session, job_id):
+        if c.AFTER_DROP_SHIFTS_DEADLINE:
+            return {
+                'error': "You can no longer drop shifts.",
+                'jobs': session.jobs_for_signups()
+            }
         try:
             shift = session.shift(job_id=job_id, attendee_id=session.logged_in_volunteer().id)
             session.delete(shift)

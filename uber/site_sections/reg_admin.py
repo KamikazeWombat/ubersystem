@@ -1,94 +1,130 @@
-import urllib
 from itertools import chain
 
 import cherrypy
 from pockets import groupify, listify
-from rpctools.jsonrpc import ServerProxy
 from sqlalchemy import and_, or_, func
+from sqlalchemy.orm.exc import NoResultFound
 
 from uber.config import c, _config
 from uber.custom_tags import pluralize
 from uber.decorators import all_renderable
 from uber.errors import HTTPRedirect
 from uber.models import Attendee, Department, DeptMembership, DeptMembershipRequest
-
-
-def _server_to_url(server):
-    if not server:
-        return ''
-    host, _, path = urllib.parse.unquote(server).replace('http://', '').replace('https://', '').partition('/')
-    if path.startswith('reggie'):
-        return 'https://{}/reggie'.format(host)
-    elif path.startswith('uber'):
-        return 'https://{}/uber'.format(host)
-    elif c.PATH == '/uber':
-        return 'https://{}{}'.format(host, c.PATH)
-    return 'https://{}'.format(host)
-
-
-def _server_to_host(server):
-    if not server:
-        return ''
-    return urllib.parse.unquote(server).replace('http://', '').replace('https://', '').split('/')[0]
-
-
-def _format_import_params(target_server, api_token):
-    target_url = _server_to_url(target_server)
-    target_host = _server_to_host(target_server)
-    remote_api_token = api_token.strip()
-    if not remote_api_token:
-        remote_api_tokens = _config.get('secret', {}).get('remote_api_tokens', {})
-        remote_api_token = remote_api_tokens.get(target_host, remote_api_tokens.get('default', ''))
-    return (target_url, target_host, remote_api_token.strip())
+from uber.utils import get_api_service_from_server
 
 
 @all_renderable()
 class Root:
+    def receipt_items(self, session, id, message=''):
+        try:
+            model = session.attendee(id)
+        except NoResultFound:
+            model = session.group(id)
+
+        return {
+            'attendee': model if isinstance(model, Attendee) else None,
+            'group': model,
+            'message': message,
+            'stripe_txn_opts': [(txn.stripe_transaction.id, txn.stripe_transaction.stripe_id)
+                                for txn in model.stripe_txn_share_logs],
+        }
+
+    def add_receipt_item(self, session, id='', **params):
+        try:
+            model = session.attendee(id)
+        except NoResultFound:
+            model = session.group(id)
+            
+        stripe_txn_id = params.get('stripe_txn_id', '')
+        if stripe_txn_id:
+            stripe_txn = session.stripe_transaction(stripe_txn_id)
+
+        session.add(session.create_receipt_item(
+            model, float(params.get('amount')) * 100, params.get('desc'), stripe_txn if stripe_txn_id else None,
+            params.get('txn_type')))
+
+        item_type = "Payment" if params.get('txn_type') == c.PAYMENT else "Refund"
+
+        raise HTTPRedirect('receipt_items?id={}&message={}', model.id, "{} added".format(item_type))
+
+    def remove_receipt_item(self, session, id='', **params):
+        item = session.receipt_item(id)
+        item_type = "Payment" if item.txn_type == c.PAYMENT else "Refund"
+        
+        attendee_or_group = item.attendee if item.attendee_id else item.group
+        session.delete(item)
+
+        raise HTTPRedirect('receipt_items?id={}&message={}', attendee_or_group.id, "{} deleted".format(item_type))
+    
+    def add_refund_item(self, session, id='', **params):
+        try:
+            model = session.attendee(id)
+        except NoResultFound:
+            model = session.group(id)
+        
+        if params.get('item_name') and params.get('item_val'):
+            model.refunded_items[params.get('item_name')] = params.get('item_val')
+            session.add(model)
+        
+        raise HTTPRedirect('receipt_items?id={}&message={}', model.id, "Item marked as refunded")
+    
+    def remove_refund_item(self, session, id='', **params):
+        try:
+            model = session.attendee(id)
+        except NoResultFound:
+            model = session.group(id)
+        
+        if params.get('item_name') and params.get('item_val'):
+            model.refunded_items[params.get('item_name')] = params.get('item_val')
+            session.add(model)
+        
+        raise HTTPRedirect('receipt_items?id={}&message={}', model.id, "Refunded item removed")
+
+    def remove_promo_code(self, session, id=''):
+        attendee = session.attendee(id)
+        attendee.paid = c.NOT_PAID
+        attendee.promo_code = None
+        attendee.badge_status = c.NEW_STATUS
+        raise HTTPRedirect('../registration/form?id={}&message={}', id, "Promo code removed.")
+
     def import_attendees(self, session, target_server='', api_token='', query='', message=''):
-        target_url, target_host, remote_api_token = _format_import_params(target_server, api_token)
+        service, service_message, target_url = get_api_service_from_server(target_server, api_token)
+        message = message or service_message
 
-        results = {}
-        if cherrypy.request.method == 'POST':
-            if not remote_api_token:
-                message = 'No API token given and could not find a token for: {}'.format(target_host)
-            elif not target_url:
-                message = 'Unrecognized hostname: {}'.format(target_server)
+        attendees, existing_attendees, results = {}, {}, {}
 
-            if not message:
-                try:
-                    uri = '{}/jsonrpc/'.format(target_url)
-                    service = ServerProxy(uri=uri, extra_headers={'X-Auth-Token': remote_api_token})
-                    results = service.attendee.export(query=query)
-                except Exception as ex:
-                    message = str(ex)
+        if service:
+            try:
+                results = service.attendee.export(query=query)
+            except Exception as ex:
+                message = str(ex)
 
-        attendees = results.get('attendees', [])
-        for attendee in attendees:
-            attendee['href'] = '{}/registration/form?id={}'.format(target_url, attendee['id'])
+        if cherrypy.request.method == 'POST' and not message:
+            attendees = results.get('attendees', [])
+            for attendee in attendees:
+                attendee['href'] = '{}/registration/form?id={}'.format(target_url, attendee['id'])
 
-        if attendees:
-            attendees_by_name_email = groupify(attendees, lambda a: (
-                a['first_name'].lower(),
-                a['last_name'].lower(),
-                Attendee.normalize_email(a['email']),
-            ))
+            if attendees:
+                attendees_by_name_email = groupify(attendees, lambda a: (
+                    a['first_name'].lower(),
+                    a['last_name'].lower(),
+                    Attendee.normalize_email(a['email']),
+                ))
 
-            filters = [
-                and_(
-                    func.lower(Attendee.first_name) == first,
-                    func.lower(Attendee.last_name) == last,
-                    Attendee.normalized_email == email,
-                )
-                for first, last, email in attendees_by_name_email.keys()
-            ]
+                filters = [
+                    and_(
+                        func.lower(Attendee.first_name) == first,
+                        func.lower(Attendee.last_name) == last,
+                        Attendee.normalized_email == email,
+                    )
+                    for first, last, email in attendees_by_name_email.keys()
+                ]
 
-            existing_attendees = session.query(Attendee).filter(or_(*filters)).all()
-            for attendee in existing_attendees:
-                existing_key = (attendee.first_name.lower(), attendee.last_name.lower(), attendee.normalized_email)
-                attendees_by_name_email.pop(existing_key, {})
-            attendees = list(chain(*attendees_by_name_email.values()))
-        else:
-            existing_attendees = []
+                existing_attendees = session.query(Attendee).filter(or_(*filters)).all()
+                for attendee in existing_attendees:
+                    existing_key = (attendee.first_name.lower(), attendee.last_name.lower(), attendee.normalized_email)
+                    attendees_by_name_email.pop(existing_key, {})
+                attendees = list(chain(*attendees_by_name_email.values()))
 
         return {
             'target_server': target_server,
@@ -110,11 +146,9 @@ class Root:
                                api_token,
                                query)
 
-        target_url, target_host, remote_api_token = _format_import_params(target_server, api_token)
-        results = {}
+        service, message, target_url = get_api_service_from_server(target_server, api_token)
+
         try:
-            uri = '{}/jsonrpc/'.format(target_url)
-            service = ServerProxy(uri=uri, extra_headers={'X-Auth-Token': remote_api_token})
             results = service.attendee.export(query=','.join(listify(attendee_ids)), full=True)
         except Exception as ex:
             raise HTTPRedirect(

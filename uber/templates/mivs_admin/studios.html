@@ -27,7 +27,7 @@
     </td>
     <td>
       {%- if studio.primary_contacts[0].matching_attendee -%}
-        <a href="../registration/form?id={{ studio.primary_contacts[0].matching_attendee.id }}">{{ studio.primary_contacts[0].full_name }}</a>
+        <a href="#attendee_form?id={{ studio.primary_contacts[0].matching_attendee.id }}">{{ studio.primary_contacts[0].full_name }}</a>
       {%- else -%}
         {{ studio.primary_contacts[0].full_name }}
       {%- endif %}
@@ -48,5 +48,4 @@
 {% endfor %}
 </tbody>
 </table>
-
 {% endblock %}

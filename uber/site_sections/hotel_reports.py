@@ -1,7 +1,9 @@
 from collections import defaultdict, OrderedDict
 from datetime import timedelta
+import random
 
-from sqlalchemy import or_
+from pockets.autolog import log
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import joinedload, subqueryload
 
 from uber.config import c
@@ -132,6 +134,13 @@ def _hours_vs_rooms_by_dept(session):
             dept_report['total_hotel_shoulder_nights'] += len(attendee_report['hotel_shoulder_nights'])
 
     return OrderedDict(sorted(departments.items(), key=lambda d: d[0].name))
+
+
+def _generate_hotel_pin():
+    """
+    Returns a 7 digit number formatted as a zero padded string.
+    """
+    return '{:07d}'.format(random.randint(0, 9999999))
 
 
 @all_renderable()
@@ -486,7 +495,10 @@ class Root:
         if c.PREREG_REQUEST_HOTEL_INFO_DURATION > 0:
             eligibility_filters.append(Attendee.requested_hotel_info == True)  # noqa: E711
         if c.PREREG_HOTEL_ELIGIBILITY_CUTOFF:
-            eligibility_filters.append(Attendee.registered <= c.PREREG_HOTEL_ELIGIBILITY_CUTOFF)
+            eligibility_filters.append(or_(
+                Attendee.registered <= c.PREREG_HOTEL_ELIGIBILITY_CUTOFF,
+                and_(Attendee.paid == c.NEED_NOT_PAY, Attendee.promo_code == None))
+            )
 
         hotel_query = session.query(Attendee).filter(*eligibility_filters).filter(
             Attendee.badge_status.notin_([c.INVALID_STATUS, c.REFUNDED_STATUS]),
@@ -513,6 +525,28 @@ class Root:
                 a.hotel_pin = new_hotel_pin
             session.commit()
 
-        out.writerow(['First Name', 'Last Name', 'E-mail Address', 'Password'])
-        for a in sorted(hotel_query.all(), key=lambda a: a.legal_name or a.full_name):
-            out.writerow([a.legal_first_name, a.legal_last_name, a.email, a.hotel_pin])
+        headers = ['First Name', 'Last Name', 'E-mail Address', 'LoginID']
+        for count in range(2, 21):
+            headers.append('LoginID{}'.format(count))
+
+        out.writerow(headers)
+        added = set()
+
+        hotel_results = sorted(hotel_query.all(), key=lambda a: a.legal_name or a.full_name)
+
+        matching_attendees = defaultdict(list)
+        for a in hotel_results:
+            matching_attendees[a.first_name, a.last_name, a.email].append(a)
+
+        for a in hotel_results:
+            row = [a.legal_first_name, a.legal_last_name, a.email, a.hotel_pin]
+
+            if a.hotel_pin not in added:
+                added.add(a.hotel_pin)
+
+                for matching_attendee in matching_attendees[a.first_name, a.last_name, a.email]:
+                    if matching_attendee.id != a.id:
+                        row.append(matching_attendee.hotel_pin)
+                        added.add(matching_attendee.hotel_pin)
+
+                out.writerow(row)

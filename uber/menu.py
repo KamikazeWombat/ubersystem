@@ -11,7 +11,7 @@ class MenuItem:
     submenu = None  # submenu to show
     name = None     # name of Menu item to show
 
-    def __init__(self, href=None, submenu=None, name=None):
+    def __init__(self, href=None, submenu=None, name=None, access_override=None):
         assert submenu or href, "menu items must contain ONE nonempty: href or submenu"
         assert not submenu or not href, "menu items must not contain both a href and submenu"
 
@@ -21,6 +21,7 @@ class MenuItem:
             self.href = href
 
         self.name = name
+        self.access_override = access_override
 
     def append_menu_item(self, m):
         """
@@ -53,8 +54,10 @@ class MenuItem:
         Returns: dict of menu items which are allowed to be seen by the logged in user's access levels
         """
         out = {}
+        
+        page_path = self.access_override or self.href
 
-        if self.href and not c.has_section_or_page_access(page_path=self.href.strip('.'), include_read_only=True):
+        if self.href and not c.has_section_or_page_access(page_path=page_path.strip('.'), include_read_only=True):
             return None
 
         out['name'] = self.name
@@ -93,21 +96,28 @@ c.MENU = MenuItem(name='Root', submenu=[
         MenuItem(name='Access Groups', href='../accounts/access_groups'),
         MenuItem(name='API Access', href='../api/'),
         MenuItem(name='Pending Emails', href='../email_admin/pending'),
-        MenuItem(name='Add/Edit Shifts', href='../shifts_admin/'),
+        MenuItem(name='Feed of Database Changes', href='../registration/feed'),
+        MenuItem(name='Watchlist', href='../security_admin/index'),
+    ]),
+
+    MenuItem(name='Staffing', submenu=[
+        MenuItem(name='Staffers', href='../shifts_admin/staffers'),
+        MenuItem(name='Pending Staffers', href='../staffing_admin/pending_badges'),
+        MenuItem(name='View/Edit Shift Schedule', href='../shifts_admin/'),
         MenuItem(name='All Unfilled Shifts', href='../shifts_admin/everywhere'),
         MenuItem(name='Departments', href='../dept_admin/'),
         MenuItem(name='Department Checklists', href='../dept_checklist/overview'),
-        MenuItem(name='Feed of Database Changes', href='../registration/feed'),
     ]),
 
     MenuItem(name='People', submenu=[
         MenuItem(name='Attendees', href='../registration/{}'.format('?invalid=True' if c.AT_THE_CON else '')),
+        MenuItem(name='Pending Badges', href='../registration/pending_badges'),
         MenuItem(name='Promo Code Groups', href='../registration/promo_code_groups'),
-        MenuItem(name='Dealers', href='../dealer_admin/'),
-        MenuItem(name='Bands', href='../guest_admin/?filter=only-bands'),
-        MenuItem(name='Guests', href='../guest_admin/?filter=only-guests'),
-        MenuItem(name='MIVS', href='../guest_admin/?filter=only-mivss'),
-        MenuItem(name='Watchlist', href='../security_admin/index'),
+        MenuItem(name='Groups', href='../group_admin/'),
+        MenuItem(name='Dealers', href='../group_admin/#dealers', access_override='dealer_admin'),
+        MenuItem(name='Guests', href='../group_admin/#guests', access_override='guest_admin'),
+        MenuItem(name='Bands', href='../group_admin/#bands', access_override='band_admin'),
+        MenuItem(name='MIVS', href='../group_admin/#mivs', access_override='mivs_admin'),
     ]),
 
     MenuItem(name='Schedule', submenu=[
@@ -124,3 +134,22 @@ c.MENU = MenuItem(name='Root', submenu=[
 
 if c.ATTRACTIONS_ENABLED:
     c.MENU['Schedule'].append_menu_item(MenuItem(name='Attractions', href='../attractions_admin/'))
+
+
+if c.BADGE_PRINTING_ENABLED:
+    c.MENU.append_menu_item(MenuItem(name='Badge Printing', submenu=[
+        MenuItem(name='Printed Badges', href='../badge_printing/'),
+        MenuItem(name='Waiting to Print', href='../badge_printing/index?pending=True'),
+        MenuItem(name='Print Adult Badges', href='../badge_printing/print_next_badge'),
+        MenuItem(name='Print Minor Badges', href='../badge_printing/print_next_badge?minor=True'),
+    ]))
+
+
+if c.ART_SHOW_ENABLED:
+    c.MENU.append_menu_item(MenuItem(name='Art Show', submenu=[
+        MenuItem(name='Applications', href='../art_show_admin/'),
+        MenuItem(name='Link to Apply', href='../art_show_applications/'),
+        MenuItem(name='At-Con Operations', href='../art_show_admin/ops'),
+        MenuItem(name='Reports', href='../art_show_reports/index'),
+        MenuItem(name='Sales Charge Form', href='../art_show_admin/sales_charge_form'),
+        ]))

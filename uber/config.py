@@ -1,6 +1,7 @@
 import ast
 import decimal
 import hashlib
+import inspect
 import os
 import pytz
 import re
@@ -12,7 +13,7 @@ from itertools import chain
 
 import cherrypy
 import stripe
-from pockets import keydefaultdict, nesteddefaultdict
+from pockets import keydefaultdict, nesteddefaultdict, unwrap
 from pockets.autolog import log
 from sideboard.lib import cached_property, parse_config, request_cached_property
 from sqlalchemy import or_
@@ -159,7 +160,7 @@ class Config(_Overridable):
 
             # Only check bucket-based pricing if we're not checking an existing badge AND
             # we're not on-site (because on-site pricing doesn't involve checking badges sold)
-            if not dt and localized_now < c.EPOCH:
+            if not dt and not c.AT_THE_CON:
                 badges_sold = self.BADGES_SOLD
 
                 for badge_cap, bumped_price in sorted(self.PRICE_LIMITS.items()):
@@ -172,12 +173,14 @@ class Config(_Overridable):
 
     def get_badge_count_by_type(self, badge_type):
         """
-        Returns the count of all badges of the given type that we've promised to attendees.
-
+        Returns the count of all badges of the given type that we've promised to
+        attendees.  This counts uncompleted placeholder badges but NOT unpaid
+        badges, since those have by definition not been promised to anyone.
         """
         from uber.models import Session, Attendee
         with Session() as session:
             return session.query(Attendee).filter(
+                Attendee.paid != c.NOT_PAID,
                 Attendee.badge_type == badge_type,
                 Attendee.badge_status.in_([c.COMPLETED_STATUS, c.NEW_STATUS])).count()
 
@@ -193,7 +196,7 @@ class Config(_Overridable):
         return uber.utils.localized_now() > self.get_printed_badge_deadline_by_type(badge_type)
 
     def has_section_or_page_access(self, include_read_only=False, page_path=''):
-        access = uber.models.AdminAccount.access_set(include_read_only=include_read_only)
+        access = uber.models.AdminAccount.get_access_set(include_read_only=include_read_only)
         page_path = page_path or self.PAGE_PATH
 
         section = page_path.replace(page_path.split('/')[-1], '').strip('/')
@@ -214,6 +217,10 @@ class Config(_Overridable):
     def DEALER_REG_SOFT_CLOSED(self):
         return self.AFTER_DEALER_REG_DEADLINE or self.DEALER_APPS >= self.MAX_DEALER_APPS \
             if self.MAX_DEALER_APPS else self.AFTER_DEALER_REG_DEADLINE
+            
+    @property
+    def ART_SHOW_OPEN(self):
+        return self.AFTER_ART_SHOW_REG_START and self.BEFORE_ART_SHOW_DEADLINE
 
     @property
     def SELF_SERVICE_REFUNDS_OPEN(self):
@@ -231,12 +238,19 @@ class Config(_Overridable):
 
     @request_cached_property
     @dynamic
-    def ATTENDEE_BADGES_SOLD(self):
+    def ATTENDEE_BADGE_COUNT(self):
+        """
+        c.ATTENDEE_BADGE_COUNT is already provided via getattr, but redefining it here lets us cache it per request.
+        """
         return self.get_badge_count_by_type(c.ATTENDEE_BADGE)
 
     @request_cached_property
     @dynamic
     def BADGES_SOLD(self):
+        """
+        The number of badges that we've sold, including all badge types and promo code groups' badges.
+        This is used for bucket-based pricing and to estimate year-over-year sales.
+        """
         from uber.models import Session, Attendee, Group, PromoCode, PromoCodeGroup
         if self.BADGES_SOLD_ESTIMATE_ENABLED:
             with Session() as session:
@@ -273,10 +287,7 @@ class Config(_Overridable):
 
         if current_price_tier != -1 and c.ORDERED_PRICE_LIMITS[current_price_tier] == c.ORDERED_PRICE_LIMITS[-1] \
                 or not c.ORDERED_PRICE_LIMITS:
-            if c.MAX_BADGE_SALES:
-                difference = c.MAX_BADGE_SALES - c.BADGES_SOLD
-            else:
-                return -1
+            return -1
         else:
             for key, val in c.PRICE_LIMITS.items():
                 if c.ORDERED_PRICE_LIMITS[current_price_tier+1] == val:
@@ -371,14 +382,14 @@ class Config(_Overridable):
             return [(amt, desc) for amt, desc in self.DONATION_TIER_OPTS
                     if amt not in self.kickin_availability_matrix or self.kickin_availability_matrix[amt]]
 
-        if self.BEFORE_SUPPORTER_DEADLINE and self.SEASON_AVAILABLE:
-            return self.DONATION_TIER_OPTS
-        if self.BEFORE_SUPPORTER_DEADLINE and self.SUPPORTER_AVAILABLE:
-            return [(amt, desc) for amt, desc in self.DONATION_TIER_OPTS if amt < self.SEASON_LEVEL]
-        elif self.BEFORE_SHIRT_DEADLINE and self.SHIRT_AVAILABLE:
-            return [(amt, desc) for amt, desc in self.DONATION_TIER_OPTS if amt < self.SUPPORTER_LEVEL]
-        else:
+        if self.BEFORE_SHIRT_DEADLINE and not self.SHIRT_AVAILABLE:
             return [(amt, desc) for amt, desc in self.DONATION_TIER_OPTS if amt < self.SHIRT_LEVEL]
+        elif self.BEFORE_SUPPORTER_DEADLINE and not self.SUPPORTER_AVAILABLE:
+            return [(amt, desc) for amt, desc in self.DONATION_TIER_OPTS if amt < self.SUPPORTER_LEVEL]
+        elif self.BEFORE_SUPPORTER_DEADLINE and not self.SEASON_AVAILABLE:
+            return [(amt, desc) for amt, desc in self.DONATION_TIER_OPTS if amt < self.SEASON_LEVEL]
+        else:
+            return self.DONATION_TIER_OPTS
 
     @property
     def PREREG_DONATION_DESCRIPTIONS(self):
@@ -387,17 +398,17 @@ class Config(_Overridable):
             donation_list = [tier for tier in c.DONATION_TIER_DESCRIPTIONS.items()
                              if tier[1]['price'] not in self.kickin_availability_matrix
                              or self.kickin_availability_matrix[tier[1]['price']]]
-        elif self.BEFORE_SUPPORTER_DEADLINE and self.SEASON_AVAILABLE:
-            donation_list = self.DONATION_TIER_DESCRIPTIONS.items()
-        elif self.BEFORE_SUPPORTER_DEADLINE and self.SUPPORTER_AVAILABLE:
-            donation_list = [tier for tier in c.DONATION_TIER_DESCRIPTIONS.items()
-                             if tier[1]['price'] < self.SEASON_LEVEL]
-        elif self.BEFORE_SHIRT_DEADLINE and self.SHIRT_AVAILABLE:
-            donation_list = [tier for tier in c.DONATION_TIER_DESCRIPTIONS.items()
-                             if tier[1]['price'] < self.SUPPORTER_LEVEL]
-        else:
+        elif self.BEFORE_SHIRT_DEADLINE and not self.SHIRT_AVAILABLE:
             donation_list = [tier for tier in c.DONATION_TIER_DESCRIPTIONS.items()
                              if tier[1]['price'] < self.SHIRT_LEVEL]
+        elif self.BEFORE_SUPPORTER_DEADLINE and not self.SUPPORTER_AVAILABLE:
+            donation_list = [tier for tier in c.DONATION_TIER_DESCRIPTIONS.items()
+                             if tier[1]['price'] < self.SUPPORTER_LEVEL]
+        elif self.BEFORE_SUPPORTER_DEADLINE and self.SEASON_AVAILABLE:
+            donation_list = [tier for tier in c.DONATION_TIER_DESCRIPTIONS.items()
+                             if tier[1]['price'] < self.SEASON_LEVEL]
+        else:
+            donation_list = self.DONATION_TIER_DESCRIPTIONS.items()
 
         donation_list = sorted(donation_list, key=lambda tier: tier[1]['price'])
 
@@ -463,7 +474,7 @@ class Config(_Overridable):
         week_from_now = c.EVENT_TIMEZONE.localize(datetime.combine(date.today() + timedelta(days=7), time(23, 59)))
         return min(week_from_now, c.UBER_TAKEDOWN, c.EPOCH)
 
-    @property
+    @request_cached_property
     @dynamic
     def AT_THE_DOOR_BADGE_OPTS(self):
         """
@@ -508,24 +519,13 @@ class Config(_Overridable):
         return not self.AT_OR_POST_CON
 
     @property
-    def STAFF_GET_FOOD(self):
-        """
-        Certain events may run a complimentary consuite for staff and guests. Whether or not the consuite exists changes
-        a lot of little things, like whether we collect food restrictions or describe free food as a benefit to
-        staffing. To turn this on, add a department with the variable name `food_prep` to [[job_location]].
-        Returns:
-            Boolean: true if `food_prep` is defined in [[job_location]] config
-        """
-        return getattr(c, 'FOOD_PREP', None) in c.JOB_LOCATIONS
-
-    @property
     def FINAL_EMAIL_DEADLINE(self):
         return min(c.UBER_TAKEDOWN, c.EPOCH)
 
     @property
     def CSRF_TOKEN(self):
         uber.utils.ensure_csrf_token_exists()
-        return cherrypy.session['csrf_token'] if 'csrf_token' in cherrypy.session else ''
+        return cherrypy.session.get('csrf_token', '')
 
     @property
     def QUERY_STRING(self):
@@ -562,7 +562,7 @@ class Config(_Overridable):
             with Session() as session:
                 attrs = Attendee.to_dict_default_attrs + ['admin_account', 'assigned_depts']
                 admin_account = session.query(AdminAccount) \
-                    .filter_by(id=cherrypy.session['account_id']) \
+                    .filter_by(id=cherrypy.session.get('account_id')) \
                     .options(subqueryload(AdminAccount.attendee).subqueryload(Attendee.assigned_depts)).one()
 
                 return admin_account.attendee.to_dict(attrs)
@@ -602,11 +602,26 @@ class Config(_Overridable):
 
     @request_cached_property
     @dynamic
-    def DEFAULT_DEPARTMENT_ID(self):
+    def ADMIN_DEPARTMENTS(self):
+        return dict(self.ADMIN_DEPARTMENT_OPTS)
+
+    @request_cached_property
+    @dynamic
+    def ADMIN_DEPARTMENT_OPTS(self):
         from uber.models import Session, Department
+
         with Session() as session:
-            dept = session.query(Department).order_by(Department.name).first()
-            return dept.id
+            query = session.query(Department).order_by(Department.name)
+            current_admin = session.admin_attendee()
+            if getattr(current_admin.admin_account, 'full_shifts_admin', None):
+                return [(d.id, d.name) for d in query]
+            else:
+                return [(d.id, d.name) for d in query if d.id in current_admin.assigned_depts_ids]
+
+    @request_cached_property
+    @dynamic
+    def DEFAULT_DEPARTMENT_ID(self):
+        return list(c.ADMIN_DEPARTMENTS.keys())[0] if c.ADMIN_DEPARTMENTS else 0
 
     @property
     def DEFAULT_REGDESK_INT(self):
@@ -623,15 +638,8 @@ class Config(_Overridable):
     def get_kickin_count(self, kickin_level):
         from uber.models import Session, Attendee
         with Session() as session:
-            attendees = session.query(Attendee)
-            individual_supporters = attendees.filter(
-                Attendee.paid.in_([self.HAS_PAID, self.REFUNDED]),
-                Attendee.amount_extra >= kickin_level).count()
-            group_supporters = attendees.filter(
-                Attendee.paid == self.PAID_BY_GROUP,
-                Attendee.amount_extra >= kickin_level,
-                Attendee.amount_paid >= kickin_level).count()
-            return individual_supporters + group_supporters
+            count = session.query(Attendee).filter_by(amount_extra=kickin_level).count()
+        return count
 
     @request_cached_property
     @dynamic
@@ -651,7 +659,7 @@ class Config(_Overridable):
     @property
     @dynamic
     def REMAINING_BADGES(self):
-        return max(0, self.MAX_BADGE_SALES - self.BADGES_SOLD)
+        return max(0, self.ATTENDEE_BADGE_STOCK - self.ATTENDEE_BADGE_COUNT)
 
     @request_cached_property
     @dynamic
@@ -660,26 +668,90 @@ class Config(_Overridable):
 
     @request_cached_property
     @dynamic
+    def ACCESS_GROUPS(self):
+        return dict(self.ACCESS_GROUP_OPTS)
+
+    @request_cached_property
+    @dynamic
+    def ACCESS_GROUP_OPTS(self):
+        from uber.models import Session, AccessGroup
+        with Session() as session:
+            query = session.query(AccessGroup).order_by(AccessGroup.name)
+            return [(a.id, a.name) for a in query]
+
+    @request_cached_property
+    @dynamic
     def ADMIN_ACCESS_SET(self):
-        return uber.models.AdminAccount.access_set(include_read_only=True)
+        return uber.models.AdminAccount.get_access_set(include_read_only=True)
 
     @request_cached_property
     @dynamic
     def ADMIN_WRITE_ACCESS_SET(self):
-        return uber.models.AdminAccount.access_set()
+        return uber.models.AdminAccount.get_access_set()
 
     @cached_property
     def ADMIN_PAGES(self):
-        # Build a list of all site sections and their pages
-        public_site_sections = ['preregistration', 'static_views', 'landing', 'panels', 'mits',
-                                'attractions', 'emails', 'mivs', 'uber', 'angular', 'index']
-
-        app_root = cherrypy.tree.apps[c.CHERRYPY_MOUNT_PATH].root
+        public_site_sections, public_pages, pages = self.GETTABLE_SITE_PAGES
+        site_sections = cherrypy.tree.apps[c.CHERRYPY_MOUNT_PATH].root
 
         return {
-            section: [opt for opt in dir(getattr(app_root, section)) if not opt.startswith('_')]
-            for section in dir(app_root) if section not in public_site_sections and not section.startswith('_')
+            section: [opt for opt in dir(getattr(site_sections, section))
+                      if opt not in public_pages and not opt.startswith('_')]
+            for section in dir(site_sections) if section not in public_site_sections and not section.startswith('_')
         }
+        
+    @request_cached_property
+    def SITE_MAP(self):
+        public_site_sections, public_pages, pages = self.GETTABLE_SITE_PAGES
+        
+        accessible_site_sections = {section: pages for section, pages in pages.items() 
+                                    if c.has_section_or_page_access(page_path=section, include_read_only=True)}
+        for section in accessible_site_sections:
+            accessible_site_sections[section] = [page for page in accessible_site_sections[section] 
+                                                 if c.has_section_or_page_access(page_path=page['path'], include_read_only=True)]
+            
+        return sorted(accessible_site_sections.items())
+    
+    @cached_property
+    def GETTABLE_SITE_PAGES(self):
+        """
+        Introspects all available pages in the application and returns several data structures for use in displaying them.
+        Returns:
+            public_site_sections (list): a list of site sections that are accessible to the public, e.g., 'preregistration'
+            public_pages (list): a list of individual pages in non-public site sections that are accessible to the public,
+                prepended by their site section; e.g., 'registration_register' for registration/register
+            pages (defaultdict(list)): a dictionary with keys corresponding to site sections, each key containing a list
+                of key/value pairs for each page inside that section.
+                Example: 
+                    pages['registration'] = [
+                        {'name': 'Arbitrary Charge Form', 'path': '/merch_admin/arbitrary_charge_form'},
+                        {'name': 'Comments', 'path': '/registration/comments'},
+                        {'name': 'Discount', 'path': '/registration/discount'},
+                    ]
+        """
+        public_site_sections = ['static_views', 'angular', 'public', 'staffing']
+        public_pages = []
+        site_sections = cherrypy.tree.apps[c.CHERRYPY_MOUNT_PATH].root
+        modules = {name: getattr(site_sections, name) for name in dir(site_sections) if not name.startswith('_')}
+        pages = defaultdict(list)
+        for module_name, module_root in modules.items():
+            page_method = getattr(site_sections, module_name)
+            if getattr(page_method, 'public', False):
+                public_site_sections.append(module_name)
+            for name in dir(module_root):
+                method = getattr(module_root, name)
+                if getattr(page_method, 'public', False):
+                    public_pages.append(module_name + "_" + name)
+                if getattr(method, 'exposed', False):
+                    spec = inspect.getfullargspec(unwrap(method))
+                    has_defaults = len([arg for arg in spec.args[1:] if arg != 'session']) == len(spec.defaults or [])
+                    if not getattr(method, 'ajax', False) and (getattr(method, 'site_mappable', False)
+                                                               or has_defaults and not spec.varkw):
+                        pages[module_name].append({
+                            'name': name.replace('_', ' ').title(),
+                            'path': '/{}/{}'.format(module_name, name)
+                        })
+        return public_site_sections, public_pages, pages
 
     # =========================
     # mivs
@@ -688,12 +760,12 @@ class Config(_Overridable):
     @property
     @dynamic
     def CAN_SUBMIT_MIVS(self):
-        return self.MIVS_SUBMISSIONS_OPEN or c.HAS_MIVS_ADMIN_ACCESS
+        return self.MIVS_SUBMISSIONS_OPEN or self.HAS_MIVS_ADMIN_ACCESS
 
     @property
     @dynamic
     def MIVS_SUBMISSIONS_OPEN(self):
-        return not really_past_mivs_deadline(c.MIVS_DEADLINE) and c.AFTER_MIVS_START
+        return not really_past_mivs_deadline(c.MIVS_DEADLINE) and self.AFTER_MIVS_START
 
     # =========================
     # panels
@@ -708,7 +780,7 @@ class Config(_Overridable):
                 (a.attendee.id, a.attendee.full_name)
                 for a in session.query(AdminAccount)
                                 .options(joinedload(AdminAccount.attendee))
-                                .filter(AdminAccount.access.contains(str(c.PANEL_APPS)))
+                                if 'panels_admin' in a.read_or_write_access_set
             ], key=lambda tup: tup[1], reverse=False)
 
     def __getattr__(self, name):
@@ -984,8 +1056,8 @@ c.WEIGHT_OPTS = (
 )
 c.JOB_DEFAULTS = ['name', 'description', 'duration', 'slots', 'weight', 'visibility', 'required_roles_ids', 'extra15']
 
-c.PREREG_SHIRT_OPTS = sorted(c.SHIRT_OPTS)[1:]
-c.MERCH_SHIRT_OPTS = [(c.SIZE_UNKNOWN, 'select a size')] + list(c.PREREG_SHIRT_OPTS)
+c.PREREG_SHIRT_OPTS = sorted(c.PREREG_SHIRT_OPTS if c.PREREG_SHIRT_OPTS else c.SHIRT_OPTS)[1:]
+c.MERCH_SHIRT_OPTS = [(c.SIZE_UNKNOWN, 'select a size')] + sorted(list(c.SHIRT_OPTS))
 c.DONATION_TIER_OPTS = [(amt, '+ ${}: {}'.format(amt, desc) if amt else desc) for amt, desc in c.DONATION_TIER_OPTS]
 
 c.DONATION_TIER_ITEMS = {}
@@ -1209,7 +1281,8 @@ c.GUEST_CHECKLIST_ITEMS = [
     {'name': 'stage_plot', 'header': 'Stage Plans', 'is_link': True},
     {'name': 'autograph'},
     {'name': 'interview'},
-    {'name': 'travel_plans'}
+    {'name': 'travel_plans'},
+    {'name': 'rehearsal'},
 ]
 
 # Generate the possible template prefixes per step

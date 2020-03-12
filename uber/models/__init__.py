@@ -14,12 +14,13 @@ import sqlalchemy
 from dateutil import parser as dateparser
 from pockets import cached_classproperty, classproperty, listify
 from pockets.autolog import log
+from pytz import UTC
 from residue import check_constraint_naming_convention, declarative_base, JSON, SessionManager, UTCDateTime, UUID
 from sideboard.lib import on_startup, stopped
 from sqlalchemy import and_, func, or_, not_
 from sqlalchemy.event import listen
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Query, joinedload, subqueryload
+from sqlalchemy.orm import Query, joinedload, subqueryload, aliased
 from sqlalchemy.orm.attributes import get_history, instance_state
 from sqlalchemy.schema import MetaData
 from sqlalchemy.types import Boolean, Integer, Float, Date, Numeric
@@ -120,6 +121,15 @@ class MagModel:
         return self.email
 
     @property
+    def gets_emails(self):
+        """
+        In some cases, we want to apply a global filter to a model that prevents it from
+        receiving scheduled emails under certain circumstances. This property allows you
+        to define such a filter.
+        """
+        return True
+
+    @property
     def addons(self):
         """
         This exists only to be overridden by other events; it should return a
@@ -146,7 +156,7 @@ class MagModel:
         """Returns the names of all cost properties on this model."""
         return [
             s for s in cls._class_attr_names
-            if s != 'cost_property_names'
+            if s not in ['cost_property_names']
             and isinstance(getattr(cls, s), cost_property)]
 
     @cached_classproperty
@@ -325,6 +335,7 @@ class MagModel:
             return []
 
         choices = dict(self.get_field(name).type.choices)
+        val = MultiChoice.convert_if_labels(self.get_field(name).type, val)
         return [int(i) for i in str(val).split(',') if i and int(i) in choices]
 
     @suffix_property
@@ -499,15 +510,18 @@ from uber.models.types import *  # noqa: F401,E402,F403
 from uber.models.api import *  # noqa: F401,E402,F403
 from uber.models.hotel import *  # noqa: F401,E402,F403
 from uber.models.attendee_tournaments import *  # noqa: F401,E402,F403
+from uber.models.marketplace import *  # noqa: F401,E402,F403
 from uber.models.mivs import *  # noqa: F401,E402,F403
 from uber.models.mits import *  # noqa: F401,E402,F403
 from uber.models.panels import *  # noqa: F401,E402,F403
 from uber.models.attraction import *  # noqa: F401,E402,F403
 from uber.models.tabletop import *  # noqa: F401,E402,F403
 from uber.models.guests import *  # noqa: F401,E402,F403
+from uber.models.art_show import *  # noqa: F401,E402,F403
 
 # Explicitly import models used by the Session class to quiet flake8
 from uber.models.admin import AccessGroup, AdminAccount, WatchList  # noqa: E402
+from uber.models.art_show import ArtShowApplication  # noqa: E402
 from uber.models.attendee import Attendee  # noqa: E402
 from uber.models.department import Job, Shift, Department  # noqa: E402
 from uber.models.email import Email  # noqa: E402
@@ -635,13 +649,131 @@ class Session(SessionManager):
 
     class SessionMixin:
         def current_admin_account(self):
-            return self.admin_account(cherrypy.session['account_id'])
+            return self.admin_account(cherrypy.session.get('account_id'))
 
         def admin_attendee(self):
-            return self.admin_account(cherrypy.session['account_id']).attendee
+            if getattr(cherrypy, 'session', {}).get('account_id'):
+                return self.admin_account(cherrypy.session.get('account_id')).attendee
 
         def logged_in_volunteer(self):
-            return self.attendee(cherrypy.session['staffer_id'])
+            return self.attendee(cherrypy.session.get('staffer_id'))
+
+        def admin_can_see_staffer(self, staffer):
+            dept_ids_with_inherent_role = [dept_m.department_id for dept_m in 
+                                           self.admin_attendee().dept_memberships_with_inherent_role]
+            return set(staffer.assigned_depts_ids).intersection(dept_ids_with_inherent_role)
+
+        def admin_can_see_guest_group(self, guest):
+            return guest.group_type_label.upper() in self.current_admin_account().viewable_guest_group_types
+
+        def admin_can_create_attendee(self, attendee):
+            admin = self.current_admin_account()
+            if admin.full_registration_admin:
+                return True
+            
+            if attendee.badge_type == c.STAFF_BADGE:
+                return admin.full_shifts_admin
+            if attendee.badge_type in [c.CONTRACTOR_BADGE, c.ATTENDEE_BADGE] and attendee.staffing_or_will_be:
+                return admin.has_dept_level_access('shifts_admin')
+            if (attendee.group and attendee.group.guest and attendee.group.guest.group_type == c.BAND
+                ) or (attendee.badge_type == c.GUEST and c.BAND in attendee.ribbon_ints):
+                return admin.has_dept_level_access('band_admin')
+            if attendee.group and attendee.group.guest and attendee.group.guest.group_type == c.GUEST:
+                return admin.has_dept_level_access('guest_admin')
+            if c.PANELIST_RIBBON in attendee.ribbon_ints:
+                return admin.has_dept_level_access('panels_admin')
+            if attendee.is_dealer:
+                return admin.has_dept_level_access('dealer_admin')
+            if attendee.mits_applicants:
+                return admin.has_dept_level_access('mits_admin')
+            if attendee.group and attendee.group.guest and attendee.group.guest.group_type == c.MIVS:
+                return admin.has_dept_level_access('mivs_admin')
+        
+        def viewable_groups(self):
+            from uber.models import Attendee, DeptMembership, Group, GuestGroup
+            admin = self.current_admin_account()
+            
+            if admin.full_registration_admin:
+                return self.query(Group)
+            
+            subqueries = [self.query(Group).filter(Group.creator == admin.attendee)]
+            
+            group_id = admin.attendee.group.id if admin.attendee.group else ''
+            if group_id:
+                subqueries.append(self.query(Group).filter(Group.id == group_id))
+            
+            for key, val in c.GROUP_TYPE_OPTS:
+                if val.lower() + '_admin' in admin.read_or_write_access_set:
+                    subqueries.append(
+                        self.query(Group).join(
+                            GuestGroup, Group.id == GuestGroup.group_id).filter(GuestGroup.group_type == key
+                        )
+                    )
+            
+            if 'dealer_admin' in admin.read_or_write_access_set:
+                subqueries.append(
+                    self.query(Group).filter(Group.is_dealer)
+                )
+            
+            return subqueries[0].union(*subqueries[1:])
+        
+        def access_query_matrix(self):
+            """
+            There's a few different situations where we want to add certain subqueries based on
+            different site sections. This matrix returns queries keyed by site section.
+            """
+            admin = self.current_admin_account()
+            return_dict = {'created': self.query(Attendee).filter(
+                or_(Attendee.creator == admin.attendee, Attendee.id == admin.attendee.id))}
+            # Guest groups
+            for group_type, badge_and_ribbon_filter in [
+                (c.BAND, and_(Attendee.badge_type == c.GUEST_BADGE, Attendee.ribbon.contains(c.BAND))),
+                (c.GUEST, and_(Attendee.badge_type == c.GUEST_BADGE, ~Attendee.ribbon.contains(c.BAND)))
+                ]:
+                return_dict[c.GROUP_TYPES[group_type].lower() + '_admin'] = (
+                    self.query(Attendee).join(Group, Attendee.group_id == Group.id)
+                        .join(GuestGroup, Group.id == GuestGroup.group_id).filter(
+                            or_(
+                                or_(
+                                    badge_and_ribbon_filter,
+                                    and_(
+                                        Group.id == Attendee.group_id,
+                                        GuestGroup.group_id == Group.id,
+                                        GuestGroup.group_type == group_type,
+                                        )
+                                )
+                            )
+                        )
+                )
+                
+            return_dict['panels_admin'] = self.query(Attendee).filter(Attendee.ribbon.contains(c.PANELIST_RIBBON))
+            return_dict['dealer_admin'] = self.query(Attendee).join(Group, Attendee.group_id == Group.id).filter(Attendee.is_dealer)
+            return_dict['mits_admin'] = self.query(Attendee).join(MITSApplicant).filter(Attendee.mits_applicants)
+            return_dict['mivs_admin'] = (self.query(Attendee).join(Group, Attendee.group_id == Group.id)
+                    .join(GuestGroup, Group.id == GuestGroup.group_id).filter(
+                        and_(Group.id == Attendee.group_id, GuestGroup.group_id == Group.id, GuestGroup.group_type == c.MIVS)
+                    ))
+            return return_dict
+            
+        def viewable_attendees(self):
+            from uber.models import Attendee, DeptMembership, Group, GuestGroup, MITSApplicant
+            admin = self.current_admin_account()
+            
+            if admin.full_registration_admin:
+                return self.query(Attendee)
+            
+            subqueries = [self.access_query_matrix()['created']]
+            
+            for key, val in self.access_query_matrix().items():
+                if key in admin.read_or_write_access_set:
+                    subqueries.append(val)
+            
+            if admin.full_shifts_admin:
+                subqueries.append(
+                    self.query(Attendee).filter(Attendee.staffing)
+                )
+            
+            return subqueries[0].union(*subqueries[1:])
 
         def checklist_status(self, slug, department_id):
             attendee = self.admin_attendee()
@@ -730,12 +862,30 @@ class Session(SessionManager):
 
                 elif isinstance(model, Group):
                     self.add(StripeTransactionGroup(
-                        txn_id=refund_txn,
+                        txn_id=refund_txn.id,
                         group_id=model.id,
                         share=stripe_log.share
                     ))
 
-                return '', response
+                return '', response, refund_txn
+
+        def create_receipt_item(self, model, amount, desc, 
+                                stripe_txn=None, txn_type=c.PAYMENT, payment_method=c.STRIPE):
+            item = ReceiptItem(
+                txn_id=stripe_txn.id if stripe_txn else None,
+                txn_type=txn_type,
+                payment_method=payment_method,
+                amount=amount,
+                who=getattr(model, 'full_name', getattr(model, 'name', '')),
+                when=stripe_txn.when if stripe_txn else datetime.now(UTC),
+                desc=desc,
+                cost_snapshot=getattr(model, 'purchased_items', {}))
+            if isinstance(model, uber.models.Attendee):
+                item.attendee_id = getattr(model, 'id', None)
+            elif isinstance(model, uber.models.Group):
+                item.group_id = getattr(model, 'id', None)
+
+            return item
 
         def guess_attendee_watchentry(self, attendee, active=True):
             or_clauses = [
@@ -791,6 +941,65 @@ class Session(SessionManager):
 
             raise ValueError('Attendee not found')
 
+        def create_or_find_attendee_by_id(self, **params):
+            message = ''
+            if params.get('attendee_id', ''):
+                try:
+                    attendee = self.attendee(id=params['attendee_id'])
+                except Exception:
+                    try:
+                        attendee = self.attendee(public_id=params['attendee_id'])
+                    except Exception:
+                        return \
+                            None, \
+                            'The confirmation number you entered is not valid, ' \
+                            'or there is no matching badge.'
+
+                if attendee.badge_status in [c.INVALID_STATUS, c.WATCHED_STATUS]:
+                    return None, \
+                           'This badge is invalid. Please contact registration.'
+            else:
+                attendee_params = {
+                    attr: params.get(attr, '')
+                    for attr in ['first_name', 'last_name', 'email']}
+                attendee = self.attendee(attendee_params, restricted=True,
+                                         ignore_csrf=True)
+                attendee.placeholder = True
+                if not params.get('email', ''):
+                    message = 'Email address is a required field.'
+            return attendee, message
+
+        def attendee_from_marketplace_app(self, **params):
+            attendee, message = self.create_or_find_attendee_by_id(**params)
+            if message:
+                return attendee, message
+            elif attendee.marketplace_applications:
+                return attendee, \
+                       'There is already a marketplace application ' \
+                       'for that badge!'
+
+            return attendee, message
+        
+        def art_show_apps(self):
+            return self.query(ArtShowApplication).options(joinedload('attendee')).all()
+
+        def attendee_from_art_show_app(self, **params):
+            attendee, message = self.create_or_find_attendee_by_id(**params)
+            if message:
+                return attendee, message
+            elif attendee.art_show_applications:
+                return attendee, \
+                    'There is already an art show application ' \
+                    'for that badge!'
+
+            if params.get('not_attending', ''):
+                    attendee.badge_status = c.NOT_ATTENDING
+
+            return attendee, ''
+
+        def lookup_agent_code(self, code):
+            return self.query(ArtShowApplication).filter_by(agent_code=code).all()
+
         def add_promo_code_to_attendee(self, attendee, code):
             """
             Convenience method for adding a promo code to an attendee.
@@ -845,7 +1054,7 @@ class Session(SessionManager):
             if not group:
                 return None
 
-            return group.valid_codes[0]
+            return group.valid_codes[0] if group.valid_codes else None
 
         def lookup_promo_or_group_code(self, code, model=PromoCode):
             """
@@ -880,21 +1089,22 @@ class Session(SessionManager):
 
             return self.query(model).filter(clause).order_by(model.normalized_code.desc()).first()
 
-        def create_promo_code_group(self, attendee, name, badges):
+        def create_promo_code_group(self, attendee, name, badges, cost=None):
             pc_group = PromoCodeGroup(name=name, buyer=attendee)
 
-            self.add_codes_to_pc_group(pc_group, badges)
+            self.add_codes_to_pc_group(pc_group, badges, cost)
 
             return pc_group
 
-        def add_codes_to_pc_group(self, pc_group, badges):
+        def add_codes_to_pc_group(self, pc_group, badges, cost=None):
+            cost = c.get_group_price() if cost is None else cost
             for _ in range(badges):
                 self.add(PromoCode(
                     discount=0,
                     discount_type=PromoCode._FIXED_PRICE,
                     uses_allowed=1,
                     group=pc_group,
-                    cost=c.get_group_price()))
+                    cost=cost))
 
         def get_next_badge_num(self, badge_type):
             """
@@ -1025,6 +1235,31 @@ class Session(SessionManager):
             query.update({Attendee.badge_num: Attendee.badge_num + shift}, synchronize_session='evaluate')
 
             return True
+        
+        def get_next_badge_to_print(self, minor='', printerNumber='', numberOfPrinters=''):
+            badge_list = self.query(Attendee) \
+                .filter(
+                Attendee.print_pending,
+                Attendee.birthdate != None,
+                Attendee.badge_num != None).order_by(Attendee.badge_num).all()
+
+            try:
+                if minor:
+                    attendee = next(badge for badge
+                                    in badge_list
+                                    if badge.age_now_or_at_con < 18)
+                elif printerNumber != "" and numberOfPrinters != "": 
+                    attendee = next(badge for badge
+                                    in badge_list
+                                    if badge.age_now_or_at_con >= 18 and badge.badge_num % int(numberOfPrinters) == (int(printerNumber) - 1))
+                else:
+                    attendee = next(badge for badge
+                                    in badge_list
+                                    if badge.age_now_or_at_con >= 18)
+            except StopIteration:
+                return None
+
+            return attendee
 
         def valid_attendees(self):
             return self.query(Attendee).filter(Attendee.badge_status != c.INVALID_STATUS)
@@ -1033,7 +1268,7 @@ class Session(SessionManager):
             return self.query(Attendee).filter(not_(Attendee.badge_status.in_(
                 [c.INVALID_STATUS, c.REFUNDED_STATUS, c.DEFERRED_STATUS])))
 
-        def all_attendees(self, only_staffing=False):
+        def all_attendees(self, only_staffing=False, pending=False):
             """
             Returns a Query of Attendees with efficient loading for groups and
             shifts/jobs.
@@ -1048,19 +1283,23 @@ class Session(SessionManager):
             """
             staffing_filter = [Attendee.staffing == True] if only_staffing else []  # noqa: E712
 
-            badge_filter = Attendee.badge_status.in_(
-                [c.NEW_STATUS, c.COMPLETED_STATUS])
+            badge_statuses = [c.NEW_STATUS, c.COMPLETED_STATUS]
+            if pending:
+                badge_statuses.append(c.PENDING_STATUS)
+
+            badge_filter = Attendee.badge_status.in_(badge_statuses)
 
             return self.query(Attendee) \
                 .filter(badge_filter, *staffing_filter) \
                 .options(
                     subqueryload(Attendee.dept_memberships),
                     subqueryload(Attendee.group),
-                    subqueryload(Attendee.shifts).subqueryload(Shift.job).subqueryload(Job.department)) \
+                    subqueryload(Attendee.shifts).subqueryload(Shift.job).subqueryload(Job.department),
+                    subqueryload(Attendee.room_assignments)) \
                 .order_by(Attendee.full_name, Attendee.id)
 
-        def staffers(self):
-            return self.all_attendees(only_staffing=True)
+        def staffers(self, pending=False):
+            return self.all_attendees(only_staffing=True, pending=pending)
 
         def all_panelists(self):
             return self.query(Attendee).filter(or_(
@@ -1102,7 +1341,7 @@ class Session(SessionManager):
                         attendee.badge_num, attendee.badge_type_label, group.name)
             else:
                 # First preserve the attributes to copy to the new group member
-                attrs = matching[0].to_dict(attrs=['group', 'group_id', 'paid', 'amount_paid', 'ribbon'])
+                attrs = matching[0].to_dict(attrs=['group', 'group_id', 'paid', 'amount_paid_override', 'ribbon'])
 
                 # Then delete the old unassigned group member
                 self.delete(matching[0])
@@ -1118,8 +1357,21 @@ class Session(SessionManager):
                 self.commit()
 
         def search(self, text, *filters):
-            attendees = self.query(Attendee).outerjoin(Attendee.group) \
-                .options(joinedload(Attendee.group)).filter(*filters)
+
+            # We need to both outerjoin on the PromoCodeGroup table and also
+            # query it.  In order to do this we need to alias it so that the
+            # reference to PromoCodeGroup in the joinedload doesn't conflict
+            # with the outerjoin.  See https://docs.sqlalchemy.org/en/13/orm/query.html#sqlalchemy.orm.query.Query.join
+            aliased_pcg = aliased(PromoCodeGroup)
+
+            attendees = self.query(Attendee) \
+                            .outerjoin(Attendee.group) \
+                            .outerjoin(Attendee.promo_code) \
+                            .outerjoin(aliased_pcg, PromoCode.group) \
+                            .options(
+                                joinedload(Attendee.group),
+                                joinedload(Attendee.promo_code).joinedload(PromoCode.group)
+                            ).filter(*filters)
 
             if ':' in text:
                 target, term = text.split(':', 1)
@@ -1161,6 +1413,7 @@ class Session(SessionManager):
                 return attendees.filter(or_(
                     Attendee.id == terms[0],
                     Attendee.public_id == terms[0],
+                    aliased_pcg.id == terms[0],
                     Group.id == terms[0],
                     Group.public_id == terms[0]))
 
@@ -1171,7 +1424,10 @@ class Session(SessionManager):
                         Attendee.public_id == search_uuid,
                         Group.public_id == search_uuid))
 
-            checks = [Group.name.ilike('%' + text + '%')]
+            checks = [
+                Group.name.ilike('%' + text + '%'),
+                aliased_pcg.name.ilike('%' + text + '%')
+            ]
             check_attrs = [
                 'first_name', 'last_name', 'legal_name', 'badge_printed_name',
                 'email', 'comments', 'admin_notes', 'for_review', 'promo_code_group_name']
@@ -1206,11 +1462,13 @@ class Session(SessionManager):
                 return 'Custom badges have already been ordered, so you will need to select a different badge type'
             elif diff > 0:
                 for i in range(diff):
-                    group.attendees.append(Attendee(
+                    new_attendee = Attendee(
                         badge_type=new_badge_type,
                         ribbon=ribbon_to_use,
                         paid=paid,
-                        **extra_create_args))
+                        **extra_create_args)
+                    group.attendees.append(new_attendee)
+                    
             elif diff < 0:
                 if len(group.floating) < abs(diff):
                     return 'You cannot reduce the number of badges for a group to below the number of assigned badges'
@@ -1281,13 +1539,15 @@ class Session(SessionManager):
                 access={section: '5' for section in c.ADMIN_PAGES}
             )
 
-            self.add(all_access_group)
-
-            self.add(AdminAccount(
+            test_developer_account = AdminAccount(
                 attendee=attendee,
-                access_group=all_access_group,
                 hashed=bcrypt.hashpw('magfest', bcrypt.gensalt())
-            ))
+            )
+            test_developer_account.access_groups.append(all_access_group)
+
+            self.add(all_access_group)
+            self.add(test_developer_account)
+            self.commit()
 
             return True
 
@@ -1345,7 +1605,7 @@ class Session(SessionManager):
 
         def logged_in_studio(self):
             try:
-                return self.indie_studio(cherrypy.session['studio_id'])
+                return self.indie_studio(cherrypy.session.get('studio_id'))
             except Exception:
                 raise HTTPRedirect('../mivs/studio')
 
@@ -1383,29 +1643,6 @@ class Session(SessionManager):
             return self.query(IndieGame).join(IndieStudio).options(
                 joinedload(IndieGame.studio), joinedload(IndieGame.reviews)).order_by(IndieStudio.name, IndieGame.title)
 
-        def create_or_find_mivs_judge_access_group(self):
-            """
-            Looks for an admin access group with write access to only mivs_judging,
-            and creates a new one if it can't find any.
-
-            Technically, we don't need this access group -- access to mivs_judging
-            is determined by whether the admin account is linked to an IndieJudge
-            object -- but we need to give MIVS judges some sort of access group.
-            """
-
-            existing_access_groups = self.query(AccessGroup).filter(
-                AccessGroup.access['mivs_judging'].astext.cast(Integer) > 0)
-            for group in existing_access_groups:
-                if len(group.access) == 1:
-                    return group
-            new_mivs_judge_group = AccessGroup(
-                name='MIVS Judge',
-                access={'mivs_judging': '5'}
-            )
-            self.add(new_mivs_judge_group)
-            self.commit()
-            return new_mivs_judge_group
-
         # =========================
         # mits
         # =========================
@@ -1429,7 +1666,7 @@ class Session(SessionManager):
 
         def logged_in_mits_team(self):
             try:
-                team = self.mits_team(cherrypy.session['mits_team_id'])
+                team = self.mits_team(cherrypy.session.get('mits_team_id'))
                 assert not team.deleted or team.duplicate_of
             except Exception:
                 raise HTTPRedirect('../mits/login_explanation')

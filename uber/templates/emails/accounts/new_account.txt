@@ -2,13 +2,13 @@
 
 {{ creator }} has created an admin account for you on the {{ c.EVENT_NAME }} ubersystem at {{ c.URL_BASE }}.
 
-{% if account.access_group.access %}This account grants you read/write access to:
-{% for access in account.access_group.access %}
+{% if account.write_access_set %}This account grants you read/write access to:
+{% for access in account.write_access_set %}
 - {{ access }}
 {% endfor %}{% endif %}
-
-{% if account.access_group.read_only_access %}You{% if account.access_group.access %} also{% endif %} have read-only access to:
-{% for access in account.access_group.read_only_access %}
+{% if account.read_access_set %}
+You{% if account.write_access_set %} also{% endif %} have read-only access to:
+{% for access in account.read_access_set %}
 - {{ access }}
 {% endfor %}{% endif %}
 
